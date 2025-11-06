@@ -20,6 +20,44 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
 
+fn generate_jiggle_vector<const N: usize>(rng_value: u32, vec: &mut heapless::Vec<i8, N>) {
+    const UPPER: u8 = 32;
+    const LOWER: u8 = 6;
+    const STEP: i8 = 6;
+
+    // Scale rng_value into the range [LOWER, UPPER] inclusive.
+    // Use 64-bit intermediate to avoid overflow and get decent distribution.
+    let range: u32 = (UPPER - LOWER) as u32;
+    let scaled: u32 = if rng_value == u32::MAX {
+        range
+    } else {
+        ((rng_value as u64 * range as u64) / (u32::MAX as u64)) as u32
+    };
+    let x_u8 = (LOWER as u32 + scaled) as u8;
+    let mut remaining: i8 = x_u8 as i8;
+
+    // Populate forward movement in STEP-sized chunks (last chunk may be smaller).
+    while remaining > 0 && !vec.is_full() {
+        let to_push: i8 = if remaining >= STEP { STEP } else { remaining };
+        if vec.push(to_push).is_err() {
+            break;
+        }
+        remaining -= to_push;
+    }
+
+    // Mirror back to origin. Iterate in reverse over current values and push negated values
+    // until the vector is full.
+    // Note: negating a value in the expected range (1..=16) is safe for i8.
+    let clone = vec.clone();
+    for &v in clone.iter().rev() {
+        if vec.is_full() {
+            break;
+        }
+        // push negated value; ignore push failure because we checked is_full above
+        let _ = vec.push(-v);
+    }
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -76,40 +114,38 @@ async fn main(_spawner: Spawner) {
 
     let in_fut = async {
         let mut rng = RoscRng;
-
-        // Upper and lower limits for mouse movement
-        let lower_limit: u32 = 0;
-        let upper_limit: u32 = 100;
-
         loop {
-            // every 1 second
-            _ = Timer::after_secs(1).await; // TODO: update to a larger value when tested
+            // See https://wiki.osdev.org/USB_Human_Interface_Devices#USB_mouse for details on mouse reports.
+            // tldr: x and y are signed 8-bit integers representing relative movement.
 
-            // Generate random x and y signs
-            let x_sign: i8 = if rng.next_u32() % 2 == 0 { 1 } else { -1 };
-            let y_sign: i8 = if rng.next_u32() % 2 == 0 { 1 } else { -1 };
-
-            // Generate random x and y values within the specified limits
-            // This involves downcasting, but as we're just generating small mouse movements this is fine.
-            let x = x_sign
-                * (rng.next_u32() / u32::MAX * (upper_limit - lower_limit) + lower_limit) as i8;
-            let y = y_sign
-                * (rng.next_u32() / u32::MAX * (upper_limit - lower_limit) + lower_limit) as i8;
-
-            // Create the mouse HID report with the random values.
-            let report = MouseReport {
-                buttons: 0,
-                x: x,
-                y: y,
-                wheel: 0,
-                pan: 0,
-            };
-
-            // Send the HID report.
-            match writer.write_serialize(&report).await {
-                Ok(()) => {}
-                Err(e) => warn!("Failed to send report: {:?}", e),
+            // To simulate more natural mouse movement, limit the maximum movement per report, and send multiple reports.
+            const JIGGLE_VECTOR_SIZE: usize = 32;
+            let mut jiggle_vector: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
+            let reverberations = 2;
+            for _ in 0..reverberations {
+                generate_jiggle_vector(rng.next_u32(), &mut jiggle_vector);
             }
+
+            for x in jiggle_vector {
+                // Create the mouse HID report.
+                let report = MouseReport {
+                    buttons: 0,
+                    x: x,
+                    y: 0,
+                    wheel: 0,
+                    pan: 0,
+                };
+
+                // Send the HID report.
+                match writer.write_serialize(&report).await {
+                    Ok(()) => {}
+                    Err(e) => warn!("Failed to send report: {:?}", e),
+                }
+            }
+
+            // Wait a second shy of 5 mins before the next wiggle.
+            // 5 mins is a typical timeout for screen savers and sleep modes.
+            _ = Timer::after_secs(60 * 5 - 1).await;
         }
     };
 
