@@ -12,7 +12,7 @@ use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer};
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Config, Handler};
@@ -125,6 +125,16 @@ async fn main(_spawner: Spawner) {
     let in_fut = async {
         let mut rng = RoscRng;
         let mut jiggle: bool;
+        // Jiggle delay
+        let duration;
+        if cfg!(debug_assertions) {
+            // Two seconds in debug mode
+            duration = Duration::from_secs(2);
+        } else {
+            // a second shy of 5 mins before the next wiggle.
+            // 5 mins being a typical timeout for screen savers and sleep modes.
+            duration = Duration::from_secs(60 * 5 - 1);
+        }
         loop {
             {
                 // Check if jiggle is enabled.
@@ -165,9 +175,8 @@ async fn main(_spawner: Spawner) {
                 }
             }
 
-            // Wait a second shy of 5 mins before the next wiggle.
-            // 5 mins is a typical timeout for screen savers and sleep modes.
-            _ = Timer::after_secs(2).await;
+            // Wait a before next jiggle
+            _ = Timer::after(duration).await;
         }
     };
 
