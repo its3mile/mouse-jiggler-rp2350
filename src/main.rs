@@ -7,8 +7,11 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
+use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
 use embassy_usb::control::OutResponse;
@@ -19,6 +22,12 @@ use {defmt_rtt as _, panic_probe as _};
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
+
+// Jiggle mutex i.e., on and off switch
+// Enable jiggle by default
+// As soon as the device is powered i.e., inserted into a USB port, it should start jiggling the cursor
+type JiggleType = Mutex<CriticalSectionRawMutex, bool>;
+static JIGGLE: JiggleType = Mutex::new(true);
 
 fn generate_jiggle_vector<const N: usize>(rng_value: u32, vec: &mut heapless::Vec<i8, N>) {
     const UPPER: u8 = 32;
@@ -65,7 +74,7 @@ async fn main(_spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
 
     // Create usb config
-    // masqquerade as a Microsoft Basic Optical Mouse with a random serial number.
+    // Masquerade as a Microsoft Basic Optical Mouse with a random serial number.
     let mut config = Config::new(0x045E, 0x0084);
     config.manufacturer = Some("Microsoft");
     config.product = Some("Basic Optical Mouse");
@@ -115,9 +124,19 @@ async fn main(_spawner: Spawner) {
 
     let in_fut = async {
         let mut rng = RoscRng;
+        let mut jiggle: bool;
         loop {
-            // See https://wiki.osdev.org/USB_Human_Interface_Devices#USB_mouse for details on mouse reports.
-            // tldr: x and y are signed 8-bit integers representing relative movement.
+            {
+                // Check if jiggle is enabled.
+                let jiggle_unlocked = JIGGLE.lock().await;
+                jiggle = *jiggle_unlocked;
+                // Implicit release mutex at end of inner scope
+            }
+            if !jiggle {
+                // Jiggle is disabled, wait a bit and check again in next iteration
+                _ = Timer::after_millis(1000).await;
+                continue;
+            }
 
             // To simulate more natural mouse movement, limit the maximum movement per report, and send multiple reports.
             const JIGGLE_VECTOR_SIZE: usize = 32;
@@ -127,6 +146,8 @@ async fn main(_spawner: Spawner) {
                 generate_jiggle_vector(rng.next_u32(), &mut jiggle_vector);
             }
 
+            // See https://wiki.osdev.org/USB_Human_Interface_Devices#USB_mouse for details on mouse reports.
+            // tldr: x and y are signed 8-bit integers representing relative movement.
             for x in jiggle_vector {
                 // Create the mouse HID report.
                 let report = MouseReport {
@@ -146,7 +167,7 @@ async fn main(_spawner: Spawner) {
 
             // Wait a second shy of 5 mins before the next wiggle.
             // 5 mins is a typical timeout for screen savers and sleep modes.
-            _ = Timer::after_secs(60 * 5 - 1).await;
+            _ = Timer::after_secs(2).await;
         }
     };
 
@@ -154,9 +175,45 @@ async fn main(_spawner: Spawner) {
         reader.run(false, &mut request_handler).await;
     };
 
+    let led_fut = async {
+        let mut button = Input::new(p.PIN_23, Pull::Down);
+        let mut led_r: Output<'_> = Output::new(p.PIN_18, Level::High);
+        let mut led_g: Output<'_> = Output::new(p.PIN_19, Level::Low);
+        let mut led_b: Output<'_> = Output::new(p.PIN_20, Level::High);
+        let mut jiggle: bool;
+
+        loop {
+            // Blocking wait for BOOT button press
+            button.wait_for_falling_edge().await;
+            {
+                // Toggle and store new jiggle state
+                let mut jiggle_unlocked = JIGGLE.lock().await;
+                *jiggle_unlocked = !(*jiggle_unlocked);
+                jiggle = *jiggle_unlocked;
+                // Implicit release mutex at end of inner scope
+            }
+
+            // Update LED color based on state
+            if jiggle {
+                // Jiggle enabled: green
+                led_r.set_high();
+                led_g.set_low();
+                led_b.set_high();
+            } else {
+                // Jiggle disabled: off
+                led_r.set_high();
+                led_g.set_high();
+                led_b.set_high();
+            }
+
+            // Delay for button debounce and allow other coroutines to grab the mutex
+            _ = Timer::after_millis(500).await;
+        }
+    };
+
     // Run everything concurrently.
     // If we had made everything `'static` above instead, we could do this using separate tasks instead.
-    join(usb_fut, join(in_fut, out_fut)).await;
+    join(usb_fut, join(in_fut, join(out_fut, led_fut))).await;
 }
 
 struct MyRequestHandler {}
