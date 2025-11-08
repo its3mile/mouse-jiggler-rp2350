@@ -10,62 +10,19 @@ use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Config, Handler};
 use usbd_hid::descriptor::{MouseReport, SerializedDescriptor};
+
 use {defmt_rtt as _, panic_probe as _};
+
+mod jiggle;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
-
-// Jiggle mutex i.e., on and off switch
-// Enable jiggle by default
-// As soon as the device is powered i.e., inserted into a USB port, it should start jiggling the cursor
-type JiggleType = Mutex<CriticalSectionRawMutex, bool>;
-static JIGGLE: JiggleType = Mutex::new(true);
-
-fn generate_jiggle_vector<const N: usize>(rng_value: u32, vec: &mut heapless::Vec<i8, N>) {
-    const UPPER: u8 = 32;
-    const LOWER: u8 = 6;
-    const STEP: i8 = 6;
-
-    // Scale rng_value into the range [LOWER, UPPER] inclusive.
-    // Use 64-bit intermediate to avoid overflow and get decent distribution.
-    let range: u32 = (UPPER - LOWER) as u32;
-    let scaled: u32 = if rng_value == u32::MAX {
-        range
-    } else {
-        ((rng_value as u64 * range as u64) / (u32::MAX as u64)) as u32
-    };
-    let x_u8 = (LOWER as u32 + scaled) as u8;
-    let mut remaining: i8 = x_u8 as i8;
-
-    // Populate forward movement in STEP-sized chunks (last chunk may be smaller).
-    while remaining > 0 && !vec.is_full() {
-        let to_push: i8 = if remaining >= STEP { STEP } else { remaining };
-        if vec.push(to_push).is_err() {
-            break;
-        }
-        remaining -= to_push;
-    }
-
-    // Mirror back to origin. Iterate in reverse over current values and push negated values
-    // until the vector is full.
-    // Note: negating a value in the expected range (1..=16) is safe for i8.
-    let clone = vec.clone();
-    for &v in clone.iter().rev() {
-        if vec.is_full() {
-            break;
-        }
-        // push negated value; ignore push failure because we checked is_full above
-        let _ = vec.push(-v);
-    }
-}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -124,7 +81,7 @@ async fn main(_spawner: Spawner) {
 
     let in_fut = async {
         let mut rng = RoscRng;
-        let mut jiggle: bool;
+
         // Jiggle delay
         let duration;
         if cfg!(debug_assertions) {
@@ -135,14 +92,10 @@ async fn main(_spawner: Spawner) {
             // 5 mins being a typical timeout for screen savers and sleep modes.
             duration = Duration::from_secs(60 * 5 - 1);
         }
+
         loop {
-            {
-                // Check if jiggle is enabled.
-                let jiggle_unlocked = JIGGLE.lock().await;
-                jiggle = *jiggle_unlocked;
-                // Implicit release mutex at end of inner scope
-            }
-            if !jiggle {
+            // Should we jiggle?
+            if !jiggle::state::State::is_enabled().await {
                 // Jiggle is disabled, wait a bit and check again in next iteration
                 _ = Timer::after_millis(1000).await;
                 continue;
@@ -153,7 +106,13 @@ async fn main(_spawner: Spawner) {
             let mut jiggle_vector: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
             let reverberations = 2;
             for _ in 0..reverberations {
-                generate_jiggle_vector(rng.next_u32(), &mut jiggle_vector);
+                jiggle::movement::Movement::generate_vector(
+                    rng.next_u32(),
+                    &mut jiggle_vector,
+                    None,
+                    None,
+                    None,
+                );
             }
 
             // See https://wiki.osdev.org/USB_Human_Interface_Devices#USB_mouse for details on mouse reports.
@@ -186,33 +145,22 @@ async fn main(_spawner: Spawner) {
 
     let led_fut = async {
         let mut button = Input::new(p.PIN_23, Pull::Down);
-        let mut led_r: Output<'_> = Output::new(p.PIN_18, Level::High);
         let mut led_g: Output<'_> = Output::new(p.PIN_19, Level::Low);
-        let mut led_b: Output<'_> = Output::new(p.PIN_20, Level::High);
-        let mut jiggle: bool;
 
         loop {
             // Blocking wait for BOOT button press
             button.wait_for_falling_edge().await;
-            {
-                // Toggle and store new jiggle state
-                let mut jiggle_unlocked = JIGGLE.lock().await;
-                *jiggle_unlocked = !(*jiggle_unlocked);
-                jiggle = *jiggle_unlocked;
-                // Implicit release mutex at end of inner scope
-            }
+
+            // Toggle and get state
+            let state = jiggle::state::State::toggle().await;
 
             // Update LED color based on state
-            if jiggle {
+            if state {
                 // Jiggle enabled: green
-                led_r.set_high();
                 led_g.set_low();
-                led_b.set_high();
             } else {
                 // Jiggle disabled: off
-                led_r.set_high();
                 led_g.set_high();
-                led_b.set_high();
             }
         }
     };
