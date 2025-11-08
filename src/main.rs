@@ -214,9 +214,6 @@ async fn main(_spawner: Spawner) {
                 led_g.set_high();
                 led_b.set_high();
             }
-
-            // Delay for button debounce and allow other coroutines to grab the mutex
-            _ = Timer::after_millis(500).await;
         }
     };
 
