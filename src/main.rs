@@ -101,6 +101,8 @@ async fn main(_spawner: Spawner) {
                 continue;
             }
 
+            // Should we sleep?
+
             // To simulate more natural mouse movement, limit the maximum movement per report, and send multiple reports.
             const JIGGLE_VECTOR_SIZE: usize = 32;
             let mut jiggle_vector: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
@@ -146,6 +148,10 @@ async fn main(_spawner: Spawner) {
     let led_fut = async {
         let mut button = Input::new(p.PIN_23, Pull::Down);
         let mut led_g: Output<'_> = Output::new(p.PIN_19, Level::Low);
+        // Only the green LED is used, however the device powers on with both red and blue on
+        // Initialise and turn off red and blue LEDs
+        let _led_r: Output<'_> = Output::new(p.PIN_18, Level::High);
+        let _led_b: Output<'_> = Output::new(p.PIN_20, Level::High);
 
         loop {
             // Blocking wait for BOOT button press
