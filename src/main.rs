@@ -20,6 +20,8 @@ use {defmt_rtt as _, panic_probe as _};
 
 mod jiggle;
 
+static JIGGLE_STATE: jiggle::state::State = jiggle::state::State::new();
+
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
@@ -95,7 +97,7 @@ async fn main(_spawner: Spawner) {
 
         loop {
             // Should we jiggle?
-            if !jiggle::state::State::is_enabled().await {
+            if !JIGGLE_STATE.is_enabled().await {
                 // Jiggle is disabled, wait a bit and check again in next iteration
                 _ = Timer::after_millis(1000).await;
                 continue;
@@ -158,7 +160,7 @@ async fn main(_spawner: Spawner) {
             button.wait_for_falling_edge().await;
 
             // Toggle and get state
-            let state = jiggle::state::State::toggle().await;
+            let state = JIGGLE_STATE.toggle().await;
 
             // Update LED color based on state
             if state {
