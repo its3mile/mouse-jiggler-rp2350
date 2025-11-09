@@ -109,14 +109,9 @@ async fn main(_spawner: Spawner) {
             const JIGGLE_VECTOR_SIZE: usize = 32;
             let mut jiggle_vector: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
             let reverberations = 2;
+            let movement = jiggle::movement::Movement::new();
             for _ in 0..reverberations {
-                jiggle::movement::Movement::generate_vector(
-                    rng.next_u32(),
-                    &mut jiggle_vector,
-                    None,
-                    None,
-                    None,
-                );
+                movement.generate_vector(rng.next_u32(), &mut jiggle_vector);
             }
 
             // See https://wiki.osdev.org/USB_Human_Interface_Devices#USB_mouse for details on mouse reports.
