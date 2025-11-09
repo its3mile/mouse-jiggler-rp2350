@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use defmt::{info, warn};
 use embassy_executor::Spawner;
@@ -10,17 +11,35 @@ use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Config, Handler};
 use usbd_hid::descriptor::{MouseReport, SerializedDescriptor};
-
 use {defmt_rtt as _, panic_probe as _};
 
 mod jiggle;
 
 static JIGGLE_STATE: jiggle::state::State = jiggle::state::State::new();
+
+// Determine jiggle timeout
+// 2 seconds in debug mode
+// 299 seconds being a typical timeout for screen savers and sleep modes.
+const JIGGLE_TIMEOUT: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(60 * 5 - 1)
+};
+
+// The countdown to next jiggle
+// This may be accessed in multiple coroutines, so is protected by a critical section mutex
+// Initialise as 0 (Duration::MIN) to trigger a jiggle immediately
+static JIGGLE_COUNTDOWN: Mutex<CriticalSectionRawMutex, Duration> = Mutex::new(Duration::MIN);
+
+// 1 second cycle
+const CYCLE_DURATION: Duration = Duration::from_secs(1);
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -83,28 +102,34 @@ async fn main(_spawner: Spawner) {
 
     let in_fut = async {
         let mut rng = RoscRng;
-
-        // Jiggle delay
-        let duration;
-        if cfg!(debug_assertions) {
-            // Two seconds in debug mode
-            duration = Duration::from_secs(2);
-        } else {
-            // a second shy of 5 mins before the next wiggle.
-            // 5 mins being a typical timeout for screen savers and sleep modes.
-            duration = Duration::from_secs(60 * 5 - 1);
-        }
-
         loop {
             // Should we jiggle?
             if !JIGGLE_STATE.is_enabled().await {
-                // Jiggle is disabled, wait a bit and check again in next iteration
-                _ = Timer::after_millis(1000).await;
+                // Jiggle is disabled, wait a cycle and check again in next iteration
+                Timer::after(CYCLE_DURATION).await;
                 continue;
             }
 
             // Should we sleep?
+            // Inner scope for mutex release
+            {
+                let mut jiggle_countdown_unlocked = JIGGLE_COUNTDOWN.lock().await;
+                match jiggle_countdown_unlocked.checked_sub(CYCLE_DURATION) {
+                    Some(remainder) => {
+                        // Countdown hasn't elapsed yet
+                        Timer::after(CYCLE_DURATION).await;
+                        // Decrease countdown
+                        *jiggle_countdown_unlocked = remainder;
+                        continue;
+                    }
+                    None => {
+                        // Reset the jiggle countdown
+                        *jiggle_countdown_unlocked = JIGGLE_TIMEOUT;
+                    }
+                }
+            }
 
+            // Time to jiggle
             // To simulate more natural mouse movement, limit the maximum movement per report, and send multiple reports.
             const JIGGLE_VECTOR_SIZE: usize = 32;
             let mut jiggle_vector: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
@@ -134,7 +159,18 @@ async fn main(_spawner: Spawner) {
             }
 
             // Wait a before next jiggle
-            _ = Timer::after(duration).await;
+            Timer::after(CYCLE_DURATION).await;
+
+            // Decrease countdown
+            // Inner scope for mutex release
+            {
+                let mut jiggle_countdown_unlocked = JIGGLE_COUNTDOWN.lock().await;
+                *jiggle_countdown_unlocked =
+                    match jiggle_countdown_unlocked.checked_sub(CYCLE_DURATION) {
+                        Some(remainder) => remainder,
+                        None => Duration::MIN, // This shouldn't really occur, as it JIGGLE_COUNTDOWN would have been reset in this cycle, but handle it explicitly
+                    }
+            }
         }
     };
 
@@ -161,9 +197,18 @@ async fn main(_spawner: Spawner) {
             if state {
                 // Jiggle enabled: green
                 led_g.set_low();
+
+                //
             } else {
                 // Jiggle disabled: off
                 led_g.set_high();
+            }
+
+            // Set jiggle countdown so a jiggle will be performed next cycle, when enabled
+            // Inner scope for mutex release
+            {
+                let mut jiggle_countdown_unlocked = JIGGLE_COUNTDOWN.lock().await;
+                *jiggle_countdown_unlocked = Duration::MIN;
             }
         }
     };
