@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use defmt::{info, warn};
 use embassy_executor::Spawner;
@@ -131,22 +130,24 @@ async fn main(_spawner: Spawner) {
 
             // Time to jiggle
             // To simulate more natural mouse movement, limit the maximum movement per report, and send multiple reports.
-            const JIGGLE_VECTOR_SIZE: usize = 32;
-            let mut jiggle_vector: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
             let reverberations = 2;
+            const JIGGLE_VECTOR_SIZE: usize = 64;
+            let mut jiggle_vector_v: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
+            let mut jiggle_vector_h: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
             let movement = jiggle::movement::Movement::new();
             for _ in 0..reverberations {
-                movement.generate_vector(rng.next_u32(), &mut jiggle_vector);
+                movement.generate_vector(rng.next_u32(), &mut jiggle_vector_v);
+                movement.generate_vector(rng.next_u32(), &mut jiggle_vector_h);
             }
 
             // See https://wiki.osdev.org/USB_Human_Interface_Devices#USB_mouse for details on mouse reports.
             // tldr: x and y are signed 8-bit integers representing relative movement.
-            for x in jiggle_vector {
+            for (x, y) in jiggle_vector_h.iter().zip(jiggle_vector_v.iter()) {
                 // Create the mouse HID report.
                 let report = MouseReport {
                     buttons: 0,
-                    x: x,
-                    y: 0,
+                    x: *x,
+                    y: *y,
                     wheel: 0,
                     pan: 0,
                 };
