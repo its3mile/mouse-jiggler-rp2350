@@ -27,7 +27,7 @@ impl Controller {
     }
 
     /// Return the jiggle state
-    pub async fn _is_enabled(&self) -> bool {
+    pub async fn is_enabled(&self) -> bool {
         let state: bool;
         {
             let unlocked = self.status.lock().await;

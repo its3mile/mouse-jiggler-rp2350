@@ -225,7 +225,28 @@ async fn main(_spawner: Spawner) {
 
             // Handle button press
             if is_double_press {
-                // Double press - Do something ...
+                // Double press - party ...
+
+                // Cycle through random LED colours for 5 seconds
+                let start_time = Instant::now();
+                while (Instant::now() - start_time) < Duration::from_secs(5) {
+                    set_led(
+                        &mut pwm_pio_r,
+                        &mut pwm_pio_g,
+                        &mut pwm_pio_b,
+                        RoscRng::next_u8(),
+                        RoscRng::next_u8(),
+                        RoscRng::next_u8(),
+                    );
+                    Timer::after(Duration::from_millis(150)).await; // Delay for visual effect
+                }
+
+                // Reset led colour
+                if CONTROLLER.is_enabled().await {
+                    set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
+                } else {
+                    set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 0, 0);
+                }
             } else {
                 // Single press - on and off button
                 // Toggle controller state and update LED color based on it
