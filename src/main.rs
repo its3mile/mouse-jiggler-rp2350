@@ -16,7 +16,7 @@ use embassy_rp::pio_programs::pwm::{PioPwm, PioPwmProgram};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer, with_deadline};
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Config, Handler};
@@ -237,32 +237,50 @@ async fn main(_spawner: Spawner) {
         pwm_pio_b.set_period(CoreDuration::from_micros(REFRESH_INTERVAL));
         pwm_pio_b.start();
 
-        loop {
-            // Set initial LED colour - green
-            set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
+        // Set initial LED colour - green
+        set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
 
+        loop {
             // Blocking wait for BOOT button press
             button.wait_for_falling_edge().await;
 
-            // Toggle and get state
-            let state = JIGGLE_STATE.toggle().await;
+            // Get start instant
+            let start = Instant::now();
 
-            // Update LED color based on state
-            if state {
-                // Jiggle enabled: green
-                set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
-
-                //
-            } else {
-                // Jiggle disabled: off
-                set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 0, 0);
-            }
-
-            // Set jiggle countdown so a jiggle will be performed next cycle, when enabled
-            // Inner scope for mutex release
+            // Check for rising edge within 1s of falling edge
+            match with_deadline(
+                start + Duration::from_secs(1),
+                button.wait_for_rising_edge(),
+            )
+            .await
             {
-                let mut jiggle_countdown_unlocked = JIGGLE_COUNTDOWN.lock().await;
-                *jiggle_countdown_unlocked = Duration::MIN;
+                // Button Released < 1s
+                Ok(_) => {
+                    // Toggle and get state
+                    let state = JIGGLE_STATE.toggle().await;
+
+                    // Update LED color based on state
+                    if state {
+                        // Jiggle enabled: green
+                        set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
+
+                        //
+                    } else {
+                        // Jiggle disabled: off
+                        set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 0, 0);
+                    }
+
+                    // Set jiggle countdown so a jiggle will be performed next cycle, when enabled
+                    // Inner scope for mutex release
+                    {
+                        let mut jiggle_countdown_unlocked = JIGGLE_COUNTDOWN.lock().await;
+                        *jiggle_countdown_unlocked = Duration::MIN;
+                    }
+                }
+                // button held for > 1s
+                Err(_) => {
+                    // Do nothing on hold
+                }
             }
         }
     };
