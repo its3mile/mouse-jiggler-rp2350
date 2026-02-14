@@ -2,14 +2,18 @@
 #![no_main]
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration as CoreDuration;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::peripherals::USB;
-use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_rp::gpio::{Input, Pull};
+use embassy_rp::peripherals::{PIO0, PIO1, PIO2, USB};
+use embassy_rp::pio::Instance;
+use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::pio_programs::pwm::{PioPwm, PioPwmProgram};
+use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
@@ -22,6 +26,10 @@ use {defmt_rtt as _, panic_probe as _};
 mod jiggle;
 
 static JIGGLE_STATE: jiggle::state::State = jiggle::state::State::new();
+
+// PWM period, which is the length of time for each pio wave until reset.
+// This is set to 255 to mimic RGB values, this simplifies the scaling for setting LED intensity
+const REFRESH_INTERVAL: u64 = u8::MAX as u64;
 
 // Determine jiggle timeout
 // 2 seconds in debug mode
@@ -40,15 +48,21 @@ static JIGGLE_COUNTDOWN: Mutex<CriticalSectionRawMutex, Duration> = Mutex::new(D
 // 1 second cycle
 const CYCLE_DURATION: Duration = Duration::from_secs(1);
 
-bind_interrupts!(struct Irqs {
-    USBCTRL_IRQ => InterruptHandler<USB>;
+bind_interrupts!(struct UsbIrqs {
+    USBCTRL_IRQ => UsbInterruptHandler<USB>;
+});
+
+bind_interrupts!(struct PioIrqs {
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
+    PIO2_IRQ_0 => PioInterruptHandler<PIO2>;
 });
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     // Create the driver, from the HAL.
-    let driver = Driver::new(p.USB, Irqs);
+    let driver = Driver::new(p.USB, UsbIrqs);
 
     // Create usb config
     // Masquerade as a Microsoft Basic Optical Mouse with a random serial number.
@@ -180,14 +194,53 @@ async fn main(_spawner: Spawner) {
     };
 
     let led_fut = async {
+        // Initialise BOOT as jiggle on/off button
         let mut button = Input::new(p.PIN_23, Pull::Down);
-        let mut led_g: Output<'_> = Output::new(p.PIN_19, Level::Low);
-        // Only the green LED is used, however the device powers on with both red and blue on
-        // Initialise and turn off red and blue LEDs
-        let _led_r: Output<'_> = Output::new(p.PIN_18, Level::High);
-        let _led_b: Output<'_> = Output::new(p.PIN_20, Level::High);
+
+        // Initialise R, G, and B LEDs with PWM control
+        // RGB LEDs are connected to GP18-GP20 and active low on the Pimoroni
+
+        // Red
+        let pio_led1 = Pio::new(p.PIO0, PioIrqs);
+        let Pio {
+            common: mut common_r,
+            sm0: sm0_r,
+            ..
+        } = pio_led1;
+        let prg_r: PioPwmProgram<'_, PIO0> = PioPwmProgram::new(&mut common_r);
+        let mut pwm_pio_r: PioPwm<'_, PIO0, 0> =
+            PioPwm::new(&mut common_r, sm0_r, p.PIN_18, &prg_r);
+        pwm_pio_r.set_period(CoreDuration::from_micros(REFRESH_INTERVAL));
+        pwm_pio_r.start();
+
+        // Green
+        let pio_led2: Pio<'_, PIO1> = Pio::new(p.PIO1, PioIrqs);
+        let Pio {
+            common: mut common_g,
+            sm0: sm0_g,
+            ..
+        } = pio_led2;
+        let prg_g = PioPwmProgram::new(&mut common_g);
+        let mut pwm_pio_g = PioPwm::new(&mut common_g, sm0_g, p.PIN_19, &prg_g);
+        pwm_pio_g.set_period(CoreDuration::from_micros(REFRESH_INTERVAL));
+        pwm_pio_g.start();
+
+        // Blue
+        let pio_led3 = Pio::new(p.PIO2, PioIrqs);
+        let Pio {
+            common: mut common_b,
+            sm0: sm0_b,
+            ..
+        } = pio_led3;
+        let prg_b = PioPwmProgram::new(&mut common_b);
+        let mut pwm_pio_b = PioPwm::new(&mut common_b, sm0_b, p.PIN_20, &prg_b);
+        pwm_pio_b.set_period(CoreDuration::from_micros(REFRESH_INTERVAL));
+        pwm_pio_b.start();
 
         loop {
+            // Set initial LED colour - green
+            set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
+
             // Blocking wait for BOOT button press
             button.wait_for_falling_edge().await;
 
@@ -197,12 +250,12 @@ async fn main(_spawner: Spawner) {
             // Update LED color based on state
             if state {
                 // Jiggle enabled: green
-                led_g.set_low();
+                set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
 
                 //
             } else {
                 // Jiggle disabled: off
-                led_g.set_high();
+                set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 0, 0);
             }
 
             // Set jiggle countdown so a jiggle will be performed next cycle, when enabled
@@ -284,4 +337,22 @@ impl Handler for MyDeviceHandler {
             info!("Device is no longer configured, the Vbus current limit is 100mA.");
         }
     }
+}
+
+/// function to simplify setting RGB LEDs
+fn set_led<'d, PioR, PioG, PioB, const SM_R: usize, const SM_G: usize, const SM_B: usize>(
+    pwm_pio_r: &mut PioPwm<'d, PioR, SM_R>, // Red PWM channel
+    pwm_pio_g: &mut PioPwm<'d, PioG, SM_G>, // Green PWM channel
+    pwm_pio_b: &mut PioPwm<'d, PioB, SM_B>, // Blue PWM channel
+    red: u8,                                // Red brightness (0-255)
+    green: u8,                              // Green brightness (0-255)
+    blue: u8,                               // Blue brightness (0-255)
+) where
+    PioR: Instance,
+    PioG: Instance,
+    PioB: Instance,
+{
+    pwm_pio_r.write(CoreDuration::from_micros((u8::MAX - red) as u64));
+    pwm_pio_g.write(CoreDuration::from_micros((u8::MAX - green) as u64));
+    pwm_pio_b.write(CoreDuration::from_micros((u8::MAX - blue) as u64));
 }
