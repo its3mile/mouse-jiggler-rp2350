@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
 
+use crate::controller::Controller;
+use crate::movement::Movement;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration as CoreDuration;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_futures::join::join4;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Pull};
@@ -14,39 +16,35 @@ use embassy_rp::pio::Instance;
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::pwm::{PioPwm, PioPwmProgram};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer, with_deadline};
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Config, Handler};
 use usbd_hid::descriptor::{MouseReport, SerializedDescriptor};
+
 use {defmt_rtt as _, panic_probe as _};
 
-mod jiggle;
+mod controller;
+mod movement;
 
-static JIGGLE_STATE: jiggle::state::State = jiggle::state::State::new();
+// 1 second cycle
+const CYCLE_DURATION: Duration = Duration::from_secs(1);
+
+// Jiggle controller
+// timeout is 2 seconds in debug mode and 179 seconds otherwise
+static CONTROLLER: Controller = controller::Controller::new(
+    true,
+    if cfg!(debug_assertions) {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(60 * 3 - 1)
+    },
+    CYCLE_DURATION,
+);
 
 // PWM period, which is the length of time for each pio wave until reset.
 // This is set to 255 to mimic RGB values, this simplifies the scaling for setting LED intensity
 const REFRESH_INTERVAL: u64 = u8::MAX as u64;
-
-// Determine jiggle timeout
-// 2 seconds in debug mode
-// 299 seconds being a typical timeout for screen savers and sleep modes.
-const JIGGLE_TIMEOUT: Duration = if cfg!(debug_assertions) {
-    Duration::from_secs(2)
-} else {
-    Duration::from_secs(60 * 5 - 1)
-};
-
-// The countdown to next jiggle
-// This may be accessed in multiple coroutines, so is protected by a critical section mutex
-// Initialise as 0 (Duration::MIN) to trigger a jiggle immediately
-static JIGGLE_COUNTDOWN: Mutex<CriticalSectionRawMutex, Duration> = Mutex::new(Duration::MIN);
-
-// 1 second cycle
-const CYCLE_DURATION: Duration = Duration::from_secs(1);
 
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -116,76 +114,43 @@ async fn main(_spawner: Spawner) {
     let in_fut = async {
         let mut rng = RoscRng;
         loop {
-            // Should we jiggle?
-            if !JIGGLE_STATE.is_enabled().await {
-                // Jiggle is disabled, wait a cycle and check again in next iteration
-                Timer::after(CYCLE_DURATION).await;
-                continue;
-            }
+            // Feed controller
+            if CONTROLLER.feed().await {
+                // To simulate more natural mouse movement, limit the maximum movement per report, and send multiple reports.
+                let reverberations = 2;
+                const JIGGLE_VECTOR_SIZE: usize = 64;
+                let mut jiggle_vector_v: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> =
+                    heapless::Vec::new();
+                let mut jiggle_vector_h: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> =
+                    heapless::Vec::new();
+                let movement = Movement::new();
+                for _ in 0..reverberations {
+                    movement.generate_vector(rng.next_u32(), &mut jiggle_vector_v);
+                    movement.generate_vector(rng.next_u32(), &mut jiggle_vector_h);
+                }
 
-            // Should we sleep?
-            // Inner scope for mutex release
-            {
-                let mut jiggle_countdown_unlocked = JIGGLE_COUNTDOWN.lock().await;
-                match jiggle_countdown_unlocked.checked_sub(CYCLE_DURATION) {
-                    Some(remainder) => {
-                        // Countdown hasn't elapsed yet
-                        Timer::after(CYCLE_DURATION).await;
-                        // Decrease countdown
-                        *jiggle_countdown_unlocked = remainder;
-                        continue;
-                    }
-                    None => {
-                        // Reset the jiggle countdown
-                        *jiggle_countdown_unlocked = JIGGLE_TIMEOUT;
+                // See https://wiki.osdev.org/USB_Human_Interface_Devices#USB_mouse for details on mouse reports.
+                // tldr: x and y are signed 8-bit integers representing relative movement.
+                for (x, y) in jiggle_vector_h.iter().zip(jiggle_vector_v.iter()) {
+                    // Create the mouse HID report.
+                    let report = MouseReport {
+                        buttons: 0,
+                        x: *x,
+                        y: *y,
+                        wheel: 0,
+                        pan: 0,
+                    };
+
+                    // Send the HID report.
+                    match writer.write_serialize(&report).await {
+                        Ok(()) => {}
+                        Err(e) => warn!("Failed to send report: {:?}", e),
                     }
                 }
             }
 
-            // Time to jiggle
-            // To simulate more natural mouse movement, limit the maximum movement per report, and send multiple reports.
-            let reverberations = 2;
-            const JIGGLE_VECTOR_SIZE: usize = 64;
-            let mut jiggle_vector_v: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
-            let mut jiggle_vector_h: heapless::Vec<i8, JIGGLE_VECTOR_SIZE> = heapless::Vec::new();
-            let movement = jiggle::movement::Movement::new();
-            for _ in 0..reverberations {
-                movement.generate_vector(rng.next_u32(), &mut jiggle_vector_v);
-                movement.generate_vector(rng.next_u32(), &mut jiggle_vector_h);
-            }
-
-            // See https://wiki.osdev.org/USB_Human_Interface_Devices#USB_mouse for details on mouse reports.
-            // tldr: x and y are signed 8-bit integers representing relative movement.
-            for (x, y) in jiggle_vector_h.iter().zip(jiggle_vector_v.iter()) {
-                // Create the mouse HID report.
-                let report = MouseReport {
-                    buttons: 0,
-                    x: *x,
-                    y: *y,
-                    wheel: 0,
-                    pan: 0,
-                };
-
-                // Send the HID report.
-                match writer.write_serialize(&report).await {
-                    Ok(()) => {}
-                    Err(e) => warn!("Failed to send report: {:?}", e),
-                }
-            }
-
-            // Wait a before next jiggle
+            // Wait for next cycle
             Timer::after(CYCLE_DURATION).await;
-
-            // Decrease countdown
-            // Inner scope for mutex release
-            {
-                let mut jiggle_countdown_unlocked = JIGGLE_COUNTDOWN.lock().await;
-                *jiggle_countdown_unlocked =
-                    match jiggle_countdown_unlocked.checked_sub(CYCLE_DURATION) {
-                        Some(remainder) => remainder,
-                        None => Duration::MIN, // This shouldn't really occur, as it JIGGLE_COUNTDOWN would have been reset in this cycle, but handle it explicitly
-                    }
-            }
         }
     };
 
@@ -194,7 +159,7 @@ async fn main(_spawner: Spawner) {
     };
 
     let led_fut = async {
-        // Initialise BOOT as jiggle on/off button
+        // Initialise BOOT button
         let mut button = Input::new(p.PIN_23, Pull::Down);
 
         // Initialise R, G, and B LEDs with PWM control
@@ -247,47 +212,34 @@ async fn main(_spawner: Spawner) {
             // Get start instant
             let start = Instant::now();
 
-            // Check for rising edge within 1s of falling edge
-            match with_deadline(
-                start + Duration::from_secs(1),
-                button.wait_for_rising_edge(),
+            // Check for a second falling edge within 300ms (a double press)
+            let is_double_press = match with_deadline(
+                start + Duration::from_millis(300),
+                button.wait_for_falling_edge(),
             )
             .await
             {
-                // Button Released < 1s
-                Ok(_) => {
-                    // Toggle and get state
-                    let state = JIGGLE_STATE.toggle().await;
+                Ok(_) => true,
+                Err(_) => false,
+            };
 
-                    // Update LED color based on state
-                    if state {
-                        // Jiggle enabled: green
-                        set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
-
-                        //
-                    } else {
-                        // Jiggle disabled: off
-                        set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 0, 0);
-                    }
-
-                    // Set jiggle countdown so a jiggle will be performed next cycle, when enabled
-                    // Inner scope for mutex release
-                    {
-                        let mut jiggle_countdown_unlocked = JIGGLE_COUNTDOWN.lock().await;
-                        *jiggle_countdown_unlocked = Duration::MIN;
-                    }
-                }
-                // button held for > 1s
-                Err(_) => {
-                    // Do nothing on hold
+            // Handle button press
+            if is_double_press {
+                // Double press - Do something ...
+            } else {
+                // Single press - on and off button
+                // Toggle controller state and update LED color based on it
+                if CONTROLLER.toggle().await {
+                    set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 255, 0);
+                } else {
+                    set_led(&mut pwm_pio_r, &mut pwm_pio_g, &mut pwm_pio_b, 0, 0, 0);
                 }
             }
         }
     };
 
     // Run everything concurrently.
-    // If we had made everything `'static` above instead, we could do this using separate tasks instead.
-    join(usb_fut, join(in_fut, join(out_fut, led_fut))).await;
+    join4(usb_fut, in_fut, out_fut, led_fut).await;
 }
 
 struct MyRequestHandler {}
