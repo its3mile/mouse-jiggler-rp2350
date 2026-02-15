@@ -1,0 +1,36 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust thumbv8m.main-none-eabihf Target
+        run: |
+          rustup add target thumbv8m.main-none-eabihf
+
+      - name: Install picotool
+        run: |
+          sudo apt update
+          sudo apt install -y picotool
+
+      - name: Install probe-rs
+        run: |
+          cargo binstall probe-rs-tools
+
+      - name: Build (release)
+        run: cargo build --release
+      
