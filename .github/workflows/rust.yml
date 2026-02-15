@@ -18,15 +18,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust thumbv8m.main-none-eabihf Target
-        run: |
-          rustup target add thumbv8m.main-none-eabihf
-
       - name: Install picotool
         run: |
           sudo apt update
-          sudo apt install -y picotool
-
+          sudo apt install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential libstdc++-arm-none-eabi-newlib
+          mkdir -p  ~/pico
+          cd ~/pico/
+          git clone -b master https://github.com/raspberrypi/pico-sdk.git
+          cd pico-sdk
+          git submodule update --init
+          echo 'export PICO_SDK_PATH=$HOME/pico/pico-sdk' >> $GITHUB_PATH
+          
+      - name: Install Rust thumbv8m.main-none-eabihf Target
+        run: |
+          rustup target add thumbv8m.main-none-eabihf
+          
       - name: Install probe-rs
         run: |
           cargo binstall probe-rs-tools
