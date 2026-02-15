@@ -38,5 +38,17 @@ jobs:
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/probe-rs/probe-rs/releases/latest/download/probe-rs-tools-installer.sh | sh
 
       - name: Build (release)
-        run: cargo build --release
+        run: |
+          cargo build --release
+
+      - name: Create UF2 from ELF
+        run: |
+          picotool uf2 convert target/thumbv8m.main-none-eabihf/release/mouse-jiggler-rp2350 -t elf target/thumbv8m.main-none-eabihf/release/mouse-jiggler-rp2350.uf2 -t uf2
       
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.run_id }}_${{ github.run_attempt }}
+          files: |
+           target/thumbv8m.main-none-eabihf/release/mouse-jiggler-rp2350
+           target/thumbv8m.main-none-eabihf/release/mouse-jiggler-rp2350.uf2
