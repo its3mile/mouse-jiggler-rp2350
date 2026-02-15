@@ -20,7 +20,7 @@ jobs:
 
       - name: Install Rust thumbv8m.main-none-eabihf Target
         run: |
-          rustup add target thumbv8m.main-none-eabihf
+          rustup target add thumbv8m.main-none-eabihf
 
       - name: Install picotool
         run: |
