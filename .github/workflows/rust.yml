@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install picotool
+      - name: Install Pico SDK
         run: |
           sudo apt update
           sudo apt install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential libstdc++-arm-none-eabi-newlib
@@ -28,6 +28,16 @@ jobs:
           cd pico-sdk
           git submodule update --init
           echo 'export PICO_SDK_PATH=$HOME/pico/pico-sdk' >> $GITHUB_PATH
+
+      - name: Install Picotool
+        run: |
+          mkdir -p ~/builds
+          cd ~/builds
+          git clone https://github.com/raspberrypi/picotool
+          cd picotool
+          cmake .
+          make -j 4
+          sudo make install
           
       - name: Install Rust thumbv8m.main-none-eabihf Target
         run: |
@@ -43,7 +53,7 @@ jobs:
 
       - name: Create UF2 from ELF
         run: |
-          picotool uf2 convert target/thumbv8m.main-none-eabihf/release/mouse-jiggler-rp2350 -t elf target/thumbv8m.main-none-eabihf/release/mouse-jiggler-rp2350.uf2 -t uf2
+          sudo picotool uf2 convert target/thumbv8m.main-none-eabihf/release/mouse-jiggler-rp2350 -t elf target/thumbv8m.main-none-eabihf/release/mouse-jiggler-rp2350.uf2 -t uf2
       
       - name: Create Release
         uses: softprops/action-gh-release@v2
