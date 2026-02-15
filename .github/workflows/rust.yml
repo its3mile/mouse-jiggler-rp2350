@@ -35,7 +35,7 @@ jobs:
           
       - name: Install probe-rs
         run: |
-          cargo binstall probe-rs-tools
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/probe-rs/probe-rs/releases/latest/download/probe-rs-tools-installer.sh | sh
 
       - name: Build (release)
         run: cargo build --release
