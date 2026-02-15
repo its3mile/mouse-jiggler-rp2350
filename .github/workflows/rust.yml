@@ -35,9 +35,11 @@ jobs:
           cd ~/builds
           git clone https://github.com/raspberrypi/picotool
           cd picotool
+          export PICO_SDK_PATH=$HOME/pico/pico-sdk
           cmake .
           make -j 4
           sudo make install
+          sudo picotool version
           
       - name: Install Rust thumbv8m.main-none-eabihf Target
         run: |
