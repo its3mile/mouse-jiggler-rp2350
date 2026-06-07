@@ -1,7 +1,7 @@
-# Mouse Jiggler rp2350
+# Pi Mouse Jiggler 
 
+## Table of contents
 
-## ToC
 - [Description](#description)
   - [What can it do?](#what-can-it-do)
 - [Why the Pimoroni Tiny 2350?](#why-the-pimoroni-tiny-2350)
